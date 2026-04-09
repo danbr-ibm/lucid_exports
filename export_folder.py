@@ -18,7 +18,6 @@ import re
 import sys
 import time
 import requests
-from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -32,13 +31,16 @@ CHECKPOINT_FILE = "./.export_checkpoint.json"
 LOG_FILE = "./export_log.txt"
 API_BASE_URL = "https://api.lucid.co"
 API_VERSION = "1"
+RAW_DOCUMENT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{8,}")
 DOCUMENT_ID_PATTERNS = (
     re.compile(r"/lucidchart/([A-Za-z0-9_-]{8,})/edit"),
     re.compile(r"/documents/thumb/([A-Za-z0-9_-]{8,})/"),
 )
+DOCUMENT_ID_KEYS = ("documentId", "docId", "document_id", "doc_id", "url", "href")
 DOCUMENT_TITLE_KEYS = ("title", "name", "documentName", "docName")
 FOLDER_ID_KEYS = ("folderId", "folder_id")
 PARENT_KEYS = ("parentId", "parent_id")
+NESTED_FOLDER_KEYS = ("parent", "folder", "container")
 DOCUMENT_TYPE_KEYS = ("product", "documentType", "type", "kind")
 DOCUMENT_URL_KEYS = ("editUrl", "edit_url", "editorUrl", "editor_url", "url", "href")
 NETWORK_URL_KEYWORDS = (
@@ -92,13 +94,25 @@ def extract_document_id(value: str):
         return None
     
     value = str(value).strip()
-    if re.fullmatch(r"[A-Za-z0-9_-]{8,}", value):
+    if RAW_DOCUMENT_ID_PATTERN.fullmatch(value):
         return value
     
     for pattern in DOCUMENT_ID_PATTERNS:
         match = pattern.search(value)
         if match:
             return match.group(1)
+    
+    return None
+
+def extract_document_id_from_item(item):
+    """Extract a document ID from a payload item using known key variants."""
+    if not isinstance(item, dict):
+        return None
+    
+    for key in ("id", *DOCUMENT_ID_KEYS):
+        doc_id = extract_document_id(item.get(key))
+        if doc_id:
+            return doc_id
     
     return None
 
@@ -177,7 +191,7 @@ def extract_folder_id_from_item(item):
     if direct:
         return direct
     
-    for parent_key in ("parent", "folder", "container"):
+    for parent_key in NESTED_FOLDER_KEYS:
         nested = extract_nested_id(item.get(parent_key))
         if nested:
             return nested
@@ -234,12 +248,7 @@ def item_looks_like_document(item, source_url: str = None):
     if source_url_looks_like_folder_listing(source_url):
         return False
     
-    doc_id = extract_document_id(item.get("id"))
-    if not doc_id:
-        for key in ("documentId", "docId", "document_id", "doc_id", "url", "href"):
-            doc_id = extract_document_id(item.get(key))
-            if doc_id:
-                break
+    doc_id = extract_document_id_from_item(item)
     if not doc_id:
         return False
     
@@ -257,13 +266,7 @@ def document_from_item(item, folder_id: str, source_url: str = None):
     if not item_looks_like_document(item, source_url):
         return None
     
-    doc_id = extract_document_id(item.get("id"))
-    if not doc_id:
-        for key in ("documentId", "docId", "document_id", "doc_id", "url", "href"):
-            doc_id = extract_document_id(item.get(key))
-            if doc_id:
-                break
-    
+    doc_id = extract_document_id_from_item(item)
     if not doc_id:
         return None
     
@@ -626,6 +629,18 @@ def log_export_page_context(page, prefix: str = "  "):
     if body_sample:
         log(f"{prefix}Current export body: {body_sample[:200]}")
 
+def document_output_path(output_dir: str, doc) -> str:
+    """Return the export path for a document, including nested folder paths when present."""
+    folder_path = doc.get("folder_path", "")
+    if folder_path:
+        return os.path.join(output_dir, folder_path, f"{doc['name']}.vsdx")
+    return os.path.join(output_dir, f"{doc['name']}.vsdx")
+
+def document_display_name(doc) -> str:
+    """Return a readable display path for logging."""
+    folder_path = doc.get("folder_path", "")
+    return f"{folder_path}/{doc['name']}" if folder_path else doc["name"]
+
 def build_export_urls(doc) -> list:
     """Build candidate browser URLs for exporting a document."""
     doc_id = doc["id"]
@@ -652,15 +667,8 @@ def export_document(page, doc, output_dir: str):
     """
     doc_id = doc["id"]
     doc_name = doc["name"]
-    folder_path = doc.get("folder_path", "")
-    
-    # Create full output path with subfolder structure
-    if folder_path:
-        full_output_dir = os.path.join(output_dir, folder_path)
-        os.makedirs(full_output_dir, exist_ok=True)
-        output_path = os.path.join(full_output_dir, f"{doc_name}.vsdx")
-    else:
-        output_path = os.path.join(output_dir, f"{doc_name}.vsdx")
+    output_path = document_output_path(output_dir, doc)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
     try:
         product = normalize_product(doc.get("product"))
@@ -745,6 +753,47 @@ def export_document(page, doc, output_dir: str):
         log(f"  ❌ Error: {doc_name} - {str(e)[:100]}")
         return False
 
+def get_api_headers(api_key: str) -> dict:
+    """Build Lucid API headers from the configured API key."""
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Lucid-Api-Version": API_VERSION,
+    }
+
+def fetch_paginated_items(endpoint: str, headers: dict, error_prefix: str, *, log_response: bool = False):
+    """Fetch paginated Lucid API items until no next page is present."""
+    items = []
+    page = 1
+    
+    while True:
+        url = f"{API_BASE_URL}/{endpoint}"
+        response = requests.get(
+            url,
+            headers=headers,
+            params={"page": page, "limit": 100},
+            timeout=30
+        )
+        
+        if response.status_code != 200:
+            log(f"⚠️  {error_prefix}: {response.status_code}")
+            if log_response:
+                log(f"   URL: {url}")
+                log(f"   Response: {response.text[:200]}")
+            return None
+        
+        data = response.json()
+        batch = data.get("items", [])
+        if not batch:
+            break
+        
+        items.extend(batch)
+        if not data.get("nextPageToken"):
+            break
+        
+        page += 1
+    
+    return items
+
 def extract_folder_id_and_url(input_str: str) -> tuple:
     """
     Extract folder ID and full URL from input.
@@ -783,53 +832,27 @@ def get_folders_hierarchy_api():
     if not api_key:
         return None
     
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Lucid-Api-Version": API_VERSION,
-    }
+    headers = get_api_headers(api_key)
     
     log(f"📡 Fetching folder hierarchy via API...")
     
     folders = {}
-    page = 1
     
     try:
-        while True:
-            url = f"{API_BASE_URL}/folders"
-            response = requests.get(
-                url,
-                headers=headers,
-                params={"page": page, "limit": 100},
-                timeout=30
-            )
+        items = fetch_paginated_items("folders", headers, "Folders API request failed", log_response=True)
+        if items is None:
+            return None
+        
+        for folder in items:
+            folder_id = folder.get("id")
+            folder_name = folder.get("title", "Untitled")
+            parent_id = folder.get("parent", {}).get("id")
             
-            if response.status_code != 200:
-                log(f"⚠️  Folders API request failed: {response.status_code}")
-                log(f"   URL: {url}")
-                log(f"   Response: {response.text[:200]}")
-                return None
-            
-            data = response.json()
-            items = data.get("items", [])
-            
-            if not items:
-                break
-            
-            for folder in items:
-                folder_id = folder.get("id")
-                folder_name = folder.get("title", "Untitled")
-                parent_id = folder.get("parent", {}).get("id")
-                
-                folders[folder_id] = {
-                    "name": sanitize_filename(folder_name),
-                    "parent_id": parent_id,
-                    "path": None
-                }
-            
-            page += 1
-            
-            if not data.get("nextPageToken"):
-                break
+            folders[folder_id] = {
+                "name": sanitize_filename(folder_name),
+                "parent_id": parent_id,
+                "path": None
+            }
         
         log(f"✅ Found {len(folders)} folders via API")
         return folders
@@ -890,91 +913,64 @@ def get_documents_from_folder_api(folder_id: str, folders_hierarchy=None):
         log("Will use browser-based discovery instead")
         return None
     
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Lucid-Api-Version": API_VERSION,
-    }
+    headers = get_api_headers(api_key)
     
     log(f"📡 Fetching documents from folder via API...")
     
     documents = []
-    page = 1
     
     try:
-        while True:
-            # Get all documents
-            response = requests.get(
-                f"{API_BASE_URL}/documents",
-                headers=headers,
-                params={"page": page, "limit": 100},
-                timeout=30
-            )
+        items = fetch_paginated_items("documents", headers, "API request failed")
+        if items is None:
+            return None
+        
+        for doc in items:
+            doc_folder_id = doc.get("parent", {}).get("id")
             
-            if response.status_code != 200:
-                log(f"⚠️  API request failed: {response.status_code}")
-                return None
+            # Check if document is in target folder or subfolders
+            is_in_folder = False
+            folder_path = ""
             
-            data = response.json()
-            items = data.get("items", [])
-            
-            if not items:
-                break
-            
-            # Process documents
-            for doc in items:
-                doc_folder_id = doc.get("parent", {}).get("id")
+            if str(doc_folder_id) == str(folder_id):
+                is_in_folder = True
+            elif folders_hierarchy and doc_folder_id in folders_hierarchy:
+                current_id = doc_folder_id
+                path_parts = []
                 
-                # Check if document is in target folder or subfolders
-                is_in_folder = False
-                folder_path = ""
-                
-                if str(doc_folder_id) == str(folder_id):
-                    is_in_folder = True
-                    folder_path = ""
-                elif folders_hierarchy and doc_folder_id in folders_hierarchy:
-                    # Check if this folder is a subfolder of target
-                    current_id = doc_folder_id
-                    path_parts = []
+                for _ in range(20):  # Max depth
+                    if current_id not in folders_hierarchy:
+                        break
                     
-                    for _ in range(20):  # Max depth
-                        if current_id not in folders_hierarchy:
-                            break
-                        
-                        folder_info = folders_hierarchy[current_id]
-                        
-                        if str(current_id) == str(folder_id):
-                            is_in_folder = True
-                            folder_path = "/".join(reversed(path_parts))
-                            break
-                        
-                        path_parts.append(folder_info["name"])
-                        parent_id = folder_info["parent_id"]
-                        
-                        if str(parent_id) == str(folder_id):
-                            is_in_folder = True
-                            folder_path = "/".join(reversed(path_parts))
-                            break
-                        
-                        current_id = parent_id
-                
-                if is_in_folder:
-                    doc_id = doc.get("id")
-                    doc_title = doc.get("title", "Untitled")
-                    product = normalize_product(doc.get("product", "lucidchart"))
+                    folder_info = folders_hierarchy[current_id]
                     
-                    if product == "lucidchart":
-                        documents.append({
-                            "id": doc_id,
-                            "name": sanitize_filename(doc_title),
-                            "folder_path": folder_path,
-                            "product": product,
-                            "edit_url": doc.get("editUrl") or doc.get("editorUrl") or doc.get("url")
-                        })
+                    if str(current_id) == str(folder_id):
+                        is_in_folder = True
+                        folder_path = "/".join(reversed(path_parts))
+                        break
+                    
+                    path_parts.append(folder_info["name"])
+                    parent_id = folder_info["parent_id"]
+                    
+                    if str(parent_id) == str(folder_id):
+                        is_in_folder = True
+                        folder_path = "/".join(reversed(path_parts))
+                        break
+                    
+                    current_id = parent_id
             
-            page += 1
-            
-            if not data.get("nextPageToken"):
-                break
+            if is_in_folder:
+                doc_id = doc.get("id")
+                doc_title = doc.get("title", "Untitled")
+                product = normalize_product(doc.get("product", "lucidchart"))
+                
+                if product == "lucidchart":
+                    documents.append({
+                        "id": doc_id,
+                        "name": sanitize_filename(doc_title),
+                        "folder_path": folder_path,
+                        "product": product,
+                        "edit_url": doc.get("editUrl") or doc.get("editorUrl") or doc.get("url")
+                    })
         
         log(f"✅ Found {len(documents)} documents via API")
         return documents
@@ -982,6 +978,23 @@ def get_documents_from_folder_api(folder_id: str, folders_hierarchy=None):
     except Exception as e:
         log(f"⚠️  API error: {str(e)}")
         return None
+
+def update_checkpoint_state(checkpoint, completed, failed_docs):
+    """Persist the current export progress to the checkpoint file."""
+    checkpoint["completed"] = list(completed)
+    checkpoint["failed"] = list(failed_docs.values())
+    save_checkpoint(checkpoint)
+
+def get_folder_name(page, folder_id: str) -> str:
+    """Derive a filesystem-safe folder name from the current page title."""
+    try:
+        folder_name = page.title().split('|')[0].strip()
+        if folder_name:
+            return sanitize_filename(folder_name)
+    except Exception:
+        pass
+    
+    return f"folder_{folder_id[:8]}"
 
 def main():
     # Check arguments
@@ -1047,9 +1060,9 @@ def main():
                 log("\n🌐 API unavailable, using browser-based discovery...")
             documents = discover_documents_from_folder(page, folder_id, folder_url)
             # Add empty folder_path for browser-discovered documents
-            for doc in documents:
-                if "folder_path" not in doc:
-                    doc["folder_path"] = ""
+            if documents:
+                for doc in documents:
+                    doc.setdefault("folder_path", "")
         
         if not documents:
             log("\n❌ No documents found in folder!")
@@ -1061,14 +1074,7 @@ def main():
             sys.exit(1)
         
         # Get folder name from page title
-        try:
-            folder_name = page.title().split('|')[0].strip()
-            if not folder_name:
-                folder_name = f"folder_{folder_id[:8]}"
-        except:
-            folder_name = f"folder_{folder_id[:8]}"
-        
-        folder_name = sanitize_filename(folder_name)
+        folder_name = get_folder_name(page, folder_id)
         checkpoint["folder_name"] = folder_name
         
         # Create output directory
@@ -1081,12 +1087,7 @@ def main():
         
         # Check for existing files (considering subfolder structure)
         for doc in to_process[:]:
-            folder_path = doc.get("folder_path", "")
-            if folder_path:
-                output_path = os.path.join(output_dir, folder_path, f"{doc['name']}.vsdx")
-            else:
-                output_path = os.path.join(output_dir, f"{doc['name']}.vsdx")
-            
+            output_path = document_output_path(output_dir, doc)
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 completed.add(doc["id"])
                 to_process.remove(doc)
@@ -1105,9 +1106,7 @@ def main():
         fail_count = 0
         
         for i, doc in enumerate(to_process, 1):
-            folder_path = doc.get("folder_path", "")
-            display_path = f"{folder_path}/{doc['name']}" if folder_path else doc['name']
-            log(f"[{i}/{len(to_process)}] Exporting: {display_path}")
+            log(f"[{i}/{len(to_process)}] Exporting: {document_display_name(doc)}")
             
             if export_document(page, doc, output_dir):
                 completed.add(doc["id"])
@@ -1119,15 +1118,13 @@ def main():
                 failed_docs[doc["id"]] = {
                     "id": doc["id"],
                     "name": doc["name"],
-                    "folder_path": folder_path,
+                    "folder_path": doc.get("folder_path", ""),
                     "attempts": failed_docs.get(doc["id"], {}).get("attempts", 0) + 1
                 }
             
             # Save checkpoint every 5 documents
             if i % 5 == 0:
-                checkpoint["completed"] = list(completed)
-                checkpoint["failed"] = list(failed_docs.values())
-                save_checkpoint(checkpoint)
+                update_checkpoint_state(checkpoint, completed, failed_docs)
                 log(f"  💾 Checkpoint saved ({success_count} successful, {fail_count} failed)")
             
             # Small delay between documents
@@ -1136,9 +1133,7 @@ def main():
         browser.close()
     
     # Final save
-    checkpoint["completed"] = list(completed)
-    checkpoint["failed"] = list(failed_docs.values())
-    save_checkpoint(checkpoint)
+    update_checkpoint_state(checkpoint, completed, failed_docs)
     
     # Summary
     log("\n" + "="*60)
